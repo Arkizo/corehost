@@ -1,5 +1,0 @@
-api_host: "172.16.56.100"
-api_user: "API-Admin@pam"
-api_token_id: "apiadmin"
-api_token_secret: "de9fbbb0-1443-4572-8fc9-5c210bc74cee"
-proxmox_node: "pve"

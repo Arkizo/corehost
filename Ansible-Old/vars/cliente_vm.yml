@@ -1,9 +1,0 @@
-cliente_vms:
-  - vmid: 301
-    nombre: ch-00
-    ip: 172.16.56.130
-    cores: 2
-    memory: 2048
-    hdd_secundario: 10
-    user: base
-    password: proyecto
