@@ -1,0 +1,180 @@
+---
+- name: Clonar VM desde plantilla base usando API Proxmox
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - ../vars/api.yml
+    - ../vars/db.yml
+
+  tasks:
+    # Verificar conexión a base de datos
+    - name: Verificar conexión a la base de datos
+      shell: mysql -h {{ db_host }} -u {{ db_user }} -p{{ db_password }} {{ db_name }} -e "SELECT 1"
+      register: db_check
+      ignore_errors: yes
+      changed_when: false
+
+    # Obtener VM pendiente más antigua
+    - name: Obtener VM pendiente
+      shell: >
+        mysql -h {{ db_host }} -u {{ db_user }} -p{{ db_password }} {{ db_name }}
+        -e "SELECT id, cliente_id, plan_id FROM vms
+            WHERE estado = 'pendiente'
+            ORDER BY id ASC
+            LIMIT 1"
+      register: pending_vm_result
+      changed_when: false
+      when: db_check.rc == 0
+
+    # Parsear VM pendiente
+    - name: Parsear información de VM pendiente
+      set_fact:
+        pending_vm_id: "{{ pending_vm_result.stdout_lines[1].split('\t')[0] | default('') }}"
+      when:
+        - pending_vm_result.stdout_lines is defined
+        - pending_vm_result.stdout_lines | length > 1
+
+    # Obtener siguiente VMID
+    - name: Obtener siguiente VMID
+      shell: >
+        mysql -h {{ db_host }} -u {{ db_user }} -p{{ db_password }} {{ db_name }}
+        -e "SELECT COALESCE(MAX(CAST(vmid AS UNSIGNED)), 499) + 1 AS next_vmid FROM vms"
+      register: db_vmid_result
+      changed_when: false
+      when: pending_vm_id is defined
+
+    # Obtener siguiente hostname
+    - name: Obtener siguiente hostname
+      shell: >
+        mysql -h {{ db_host }} -u {{ db_user }} -p{{ db_password }} {{ db_name }}
+        -e "SELECT CONCAT('ch-', LPAD(COALESCE(MAX(CAST(SUBSTRING_INDEX(hostname, '-', -1) AS UNSIGNED)), 0) + 1, 2, '0')) AS next_hostname
+            FROM vms
+            WHERE hostname LIKE 'ch-%'"
+      register: hostname_result
+      changed_when: false
+      when: pending_vm_id is defined
+
+    # Obtener IP pública disponible
+    - name: Obtener IP pública disponible
+      shell: >
+        mysql -h {{ db_host }} -u {{ db_user }} -p{{ db_password }} {{ db_name }}
+        -e "SELECT id, ip
+            FROM redes
+            WHERE tipo = 'publica' AND en_uso = 0
+            LIMIT 1"
+      register: public_ip_result
+      changed_when: false
+      when: pending_vm_id is defined
+
+    # Obtener IP privada disponible
+    - name: Obtener IP privada disponible
+      shell: >
+        mysql -h {{ db_host }} -u {{ db_user }} -p{{ db_password }} {{ db_name }}
+        -e "SELECT id, ip
+            FROM redes
+            WHERE tipo = 'privada' AND en_uso = 0
+            LIMIT 1"
+      register: private_ip_result
+      changed_when: false
+      when: pending_vm_id is defined
+
+    # Parsear resultados
+    - name: Parsear resultados de consultas
+      set_fact:
+        next_vmid: "{{ db_vmid_result.stdout_lines[1].split('\t')[0] | default('') }}"
+        next_hostname: "{{ hostname_result.stdout_lines[1].split('\t')[0] | default('') }}"
+        public_ip_id: "{{ public_ip_result.stdout_lines[1].split('\t')[0] | default('') }}"
+        public_ip: "{{ public_ip_result.stdout_lines[1].split('\t')[1] | default('') }}"
+        private_ip_id: "{{ private_ip_result.stdout_lines[1].split('\t')[0] | default('') }}"
+        private_ip: "{{ private_ip_result.stdout_lines[1].split('\t')[1] | default('') }}"
+      when:
+        - db_vmid_result.stdout_lines is defined
+        - hostname_result.stdout_lines is defined
+        - public_ip_result.stdout_lines is defined
+        - private_ip_result.stdout_lines is defined
+
+    # Mostrar valores
+    - name: Mostrar información VM
+      debug:
+        msg:
+          - "VM ID: {{ pending_vm_id }}"
+          - "Nuevo VMID: {{ next_vmid }}"
+          - "Hostname: {{ next_hostname }}"
+          - "IP Pública: {{ public_ip }}"
+          - "IP Privada: {{ private_ip }}"
+      when:
+        - pending_vm_id is defined
+        - next_vmid is defined
+        - next_hostname is defined
+        - public_ip is defined
+        - private_ip is defined
+
+    # Clonar VM
+    - name: Clonar plantilla
+      uri:
+        url: "https://{{ api_host }}:8006/api2/json/nodes/{{ proxmox_node }}/qemu/9000/clone"
+        method: POST
+        headers:
+          Authorization: "PVEAPIToken={{ api_user }}!{{ api_token_id }}={{ api_token_secret }}"
+        body_format: form-urlencoded
+        body:
+          newid: "{{ next_vmid }}"
+          name: "{{ next_hostname }}"
+          full: "1"
+          storage: "thin_storage"
+        validate_certs: false
+      register: clone_result
+      when:
+        - next_vmid is defined
+        - next_hostname is defined
+
+    # Esperar a que termine la clonación
+    - name: Esperar a que termine el proceso de clonación
+      uri:
+        url: "https://{{ api_host }}:8006/api2/json/nodes/{{ proxmox_node }}/tasks/{{ clone_result.json.data }}/status"
+        method: GET
+        headers:
+          Authorization: "PVEAPIToken={{ api_user }}!{{ api_token_id }}={{ api_token_secret }}"
+        validate_certs: false
+        status_code: 200
+      register: task_status
+      until: task_status.json.data.status == 'stopped'
+      retries: 24
+      delay: 10
+      when: clone_result is success
+
+    # Actualizar VM en base de datos
+    - name: Actualizar VM en base de datos
+      shell: >
+        mysql -h {{ db_host }} -u {{ db_user }} -p{{ db_password }} {{ db_name }}
+        -e "UPDATE vms
+            SET
+                vmid = {{ next_vmid }},
+                hostname = '{{ next_hostname }}',
+                ip_publica = '{{ public_ip }}',
+                ip_privada = '{{ private_ip }}',
+                estado = 'clonando'
+            WHERE id = {{ pending_vm_id }}"
+      when:
+        - pending_vm_id is defined
+        - next_vmid is defined
+        - next_hostname is defined
+        - task_status is defined
+        - task_status.json.data.status == 'stopped'
+
+    # Marcar IPs como en uso
+    - name: Marcar IPs como en uso
+      shell: >
+        mysql -h {{ db_host }} -u {{ db_user }} -p{{ db_password }} {{ db_name }}
+        -e "UPDATE redes
+            SET en_uso = 1
+            WHERE id IN (
+                {{ public_ip_id }},
+                {{ private_ip_id }}
+            )"
+      when:
+        - public_ip_id is defined
+        - private_ip_id is defined
+        - task_status is defined
+        - task_status.json.data.status == 'stopped'
+

@@ -1,0 +1,31 @@
+- name: Configurar VM clonada con Cloud-Init
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - ../vars/api.yml
+    - ../vars/cliente_vm.yml
+
+  tasks:
+    - name: Aplicar configuración Cloud-Init y hardware
+      community.general.proxmox_kvm:
+        api_host: "{{ api_host }}"
+        api_user: "{{ api_user }}"
+        api_token_id: "{{ api_token_id }}"
+        api_token_secret: "{{ api_token_secret }}"
+        node: "{{ proxmox_node }}"
+        vmid: "{{ item.vmid }}"
+        memory: "{{ item.memory }}"
+        cores: "{{ item.cores }}"
+        ciuser: "{{ item.user }}"
+        cipassword: "{{ item.password }}"
+        net:
+          net0:
+            model: virtio
+            bridge: vmbr0
+        ipconfig:
+          ipconfig0:
+            ip: "{{ item.ip }}/24"
+            gw: 172.16.56.1
+        state: present
+      loop: "{{ cliente_vms }}"
+

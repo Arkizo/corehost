@@ -1,0 +1,3 @@
+UPDATE redes SET en_uso = 0 WHERE id IN (SELECT id FROM (SELECT id FROM redes WHERE tipo IN ('publica', 'privada') AND en_uso = 1) AS temp);
+
+UPDATE vms SET estado = 'pendiente', vmid = NULL, hostname = NULL, ip_publica = NULL, ip_privada = NULL WHERE estado = 'configurando';

@@ -1,0 +1,90 @@
+-- Crear y usar la base de datos
+CREATE DATABASE IF NOT EXISTS hosting_inventari;
+USE hosting_inventari;
+
+-- Tabla clientes
+CREATE TABLE IF NOT EXISTS clientes (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  nombre VARCHAR(100) NOT NULL,
+  email VARCHAR(100) NOT NULL UNIQUE,
+  password_hash VARCHAR(255) NOT NULL,
+  telefono VARCHAR(20),
+  empresa VARCHAR(100),
+  fecha_registro DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Tabla planes de recursos
+CREATE TABLE IF NOT EXISTS planes_recursos (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  nombre VARCHAR(50) NOT NULL,
+  cores INT NOT NULL,
+  ram INT NOT NULL,
+  precio DECIMAL(10,2) NOT NULL,
+  activo BOOLEAN DEFAULT TRUE
+);
+
+-- Tabla tramos de disco
+CREATE TABLE IF NOT EXISTS tramos_disco (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  cantidad_gb INT NOT NULL,
+  precio DECIMAL(10,2) NOT NULL,
+  activo BOOLEAN DEFAULT TRUE
+);
+
+-- Tabla redes para controlar IPs
+CREATE TABLE IF NOT EXISTS redes (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  tipo ENUM('publica', 'privada') NOT NULL,
+  ip VARCHAR(15) NOT NULL UNIQUE,
+  en_uso BOOLEAN DEFAULT FALSE
+);
+
+-- Tabla máquinas virtuales
+CREATE TABLE IF NOT EXISTS vms (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  cliente_id INT NOT NULL,
+  vmid INT UNIQUE,
+  hostname VARCHAR(50) UNIQUE,
+  ip_publica VARCHAR(15),
+  ip_privada VARCHAR(15),
+  estado ENUM(
+    'pendiente', 'clonando', 'configurando', 'iniciando', 'completado',
+    'esperando_modificacion', 'ampliando_recursos', 'reduciendo_recursos', 'eliminada', 'error'
+  ) DEFAULT 'pendiente',
+  cores INT NOT NULL,
+  memory INT NOT NULL,
+  hdd INT NOT NULL,
+  disco_secundario INT,
+  plantilla_base VARCHAR(50),
+  plan_id INT,
+  disco_secundario_id INT,
+  fecha_creacion DATETIME DEFAULT CURRENT_TIMESTAMP,
+  fecha_modificacion DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (cliente_id) REFERENCES clientes(id),
+  FOREIGN KEY (plan_id) REFERENCES planes_recursos(id),
+  FOREIGN KEY (disco_secundario_id) REFERENCES tramos_disco(id)
+);
+
+-- Tabla de historial de estados de cada VM
+CREATE TABLE IF NOT EXISTS historial_estados_vm (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  vmid INT NOT NULL,
+  estado_anterior VARCHAR(50),
+  estado_nuevo VARCHAR(50),
+  fecha DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (vmid) REFERENCES vms(vmid)
+);
+
+-- Tabla de modificaciones de recursos solicitadas por el cliente
+CREATE TABLE IF NOT EXISTS modificaciones_vm (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  vmid INT NOT NULL,
+  nuevo_plan_id INT,
+  nuevo_disco_secundario_id INT,
+  estado ENUM('pendiente', 'aplicado', 'rechazado') DEFAULT 'pendiente',
+  fecha_solicitud DATETIME DEFAULT CURRENT_TIMESTAMP,
+  fecha_aplicacion DATETIME,
+  FOREIGN KEY (vmid) REFERENCES vms(vmid),
+  FOREIGN KEY (nuevo_plan_id) REFERENCES planes_recursos(id),
+  FOREIGN KEY (nuevo_disco_secundario_id) REFERENCES tramos_disco(id)
+);

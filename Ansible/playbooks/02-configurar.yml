@@ -1,0 +1,142 @@
+---
+- name: Configurar VM clonada con Cloud-Init
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - ../vars/api.yml
+    - ../vars/db.yml
+
+  tasks:
+    # Verificar conexión a base de datos
+    - name: Verificar conexión a la base de datos
+      shell: mysql -h {{ db_host }} -u {{ db_user }} -p{{ db_password }} {{ db_name }} -e "SELECT 1"
+      register: db_check
+      ignore_errors: yes
+      changed_when: false
+      no_log: true
+
+    # Obtener VM en estado 'clonando'
+    - name: Obtener detalles de VM en estado 'clonando'
+      shell: >
+        mysql -h {{ db_host }} -u {{ db_user }} -p{{ db_password }} {{ db_name }}
+        -e "SELECT
+            v.id,
+            v.vmid,
+            v.hostname,
+            v.ip_publica,
+            v.ip_privada,
+            v.plan_id,
+            v.disco_secundario_id,
+            pr.cores,
+            pr.ram,
+            td.cantidad_gb as disco_adicional
+        FROM vms v
+        JOIN planes_recursos pr ON v.plan_id = pr.id
+        LEFT JOIN tramos_disco td ON v.disco_secundario_id = td.id
+        WHERE v.estado = 'clonando'
+        ORDER BY v.id DESC
+        LIMIT 1"
+      register: vm_config_result
+      changed_when: false
+      when: db_check.rc == 0
+
+    # Parsear resultados de la consulta
+    - name: Parsear detalles de la VM
+      set_fact:
+        vm_id: "{{ vm_config_result.stdout_lines[1].split('\t')[0] }}"
+        current_vmid: "{{ vm_config_result.stdout_lines[1].split('\t')[1] }}"
+        current_hostname: "{{ vm_config_result.stdout_lines[1].split('\t')[2] }}"
+        public_ip: "{{ vm_config_result.stdout_lines[1].split('\t')[3] }}"
+        private_ip: "{{ vm_config_result.stdout_lines[1].split('\t')[4] }}"
+        cores: "{{ vm_config_result.stdout_lines[1].split('\t')[7] }}"
+        memory: "{{ vm_config_result.stdout_lines[1].split('\t')[8] }}"
+        disco_adicional: "{{ vm_config_result.stdout_lines[1].split('\t')[9] | default(0) }}"
+      when: vm_config_result.stdout_lines is defined
+
+    # Usar memoria directamente en MB (ya viene en MB de la base de datos)
+    - name: Usar memoria directamente
+      set_fact:
+        memory_mb: "{{ memory | int }}"
+      when: memory is defined
+
+    # Mostrar información de configuración
+    - name: Mostrar detalles de configuración
+      debug:
+        msg:
+          - "Configurando VM:"
+          - "VMID: {{ current_vmid }}"
+          - "Hostname: {{ current_hostname }}"
+          - "IP Pública: {{ public_ip }}"
+          - "IP Privada: {{ private_ip }}"
+          - "Cores: {{ cores }}"
+          - "Memoria: {{ memory_mb }} MB"
+          - "Disco Adicional: {{ disco_adicional }}G"
+      when: current_vmid is defined
+
+    # Configurar Cloud-Init
+    - name: Aplicar configuración Cloud-Init
+      uri:
+        url: "https://{{ api_host }}:8006/api2/json/nodes/{{ proxmox_node }}/qemu/{{ current_vmid }}/config"
+        method: POST
+        headers:
+          Authorization: "PVEAPIToken={{ api_user }}!{{ api_token_id }}={{ api_token_secret }}"
+        body_format: form-urlencoded
+        body:
+          cores: "{{ cores }}"
+          memory: "{{ memory_mb }}"
+          name: "{{ current_hostname }}"
+          ciuser: "base"
+          cipassword: "proyecto"
+          nameserver: "8.8.8.8 8.8.4.4"
+          searchdomain: "local"
+          ipconfig0: "ip={{ public_ip }}/24,gw=172.16.56.1"
+          ipconfig1: "ip={{ private_ip }}/24"
+        validate_certs: false
+      register: config_result
+      when:
+        - current_vmid is defined
+        - public_ip is defined
+        - private_ip is defined
+        - memory_mb is defined
+        - cores is defined
+
+    # Redimensionar disco principal
+    - name: Redimensionar disco principal (SCSI0)
+      uri:
+        url: "https://{{ api_host }}:8006/api2/json/nodes/{{ proxmox_node }}/qemu/{{ current_vmid }}/resize"
+        method: PUT
+        headers:
+          Authorization: "PVEAPIToken={{ api_user }}!{{ api_token_id }}={{ api_token_secret }}"
+        body_format: form-urlencoded
+        body:
+          disk: "scsi0"
+          size: "+{{ disco_adicional }}G"
+        validate_certs: false
+      register: disk_result
+      when:
+        - current_vmid is defined
+        - disco_adicional is defined
+        - disco_adicional|int > 0
+
+    # Debug para verificar respuestas de la API
+    - name: Debug salida de la configuración
+      debug:
+        var: config_result
+      when: config_result is defined
+
+    - name: Debug salida del disco
+      debug:
+        var: disk_result
+      when: disk_result is defined
+
+    # Actualizar estado en la base de datos
+    - name: Actualizar estado en la base de datos
+      shell: >
+        mysql -h {{ db_host }} -u {{ db_user }} -p{{ db_password }} {{ db_name }}
+        -e "UPDATE vms
+            SET estado = 'configurando'
+            WHERE id = {{ vm_id }}"
+      when:
+        - vm_id is defined
+        - (config_result is defined and config_result is success) or (disk_result is defined and disk_result is success)
+

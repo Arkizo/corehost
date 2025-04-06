@@ -1,0 +1,39 @@
+### Opciones: archivo de configuración de Zabbix Agent 2
+PidFile=/var/run/zabbix/zabbix_agent2.pid
+LogFile=/var/log/zabbix/zabbix_agent2.log
+LogFileSize=0
+
+# Configuración del Servidor
+Server=172.16.56.200
+ServerActive=172.16.56.200
+
+# Nombre del host (usar el hostname de la VM)
+Hostname={{ vm_hostname }}
+
+# Grupo de host
+HostMetadata=Hosting Clients
+
+# Incluir archivos de configuración adicionales
+Include=/etc/zabbix/zabbix_agent2.d/*.conf
+
+# Parámetros de timeout
+Timeout=30
+
+# Características de control de acceso
+AllowKey=system.run[*]
+
+# Configura el tiempo de registro de los datos
+RefreshActiveChecks=120
+
+# Habilitar métodos remotos
+EnableRemoteCommands=1
+
+# Permitir comandos desde el servidor
+LogRemoteCommands=1
+
+# Habilitar la monitorización de procesos
+UnsafeUserParameters=1
+
+# Plugins
+Plugins.SystemRun.LogRemoteCommands=1
+

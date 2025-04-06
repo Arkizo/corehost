@@ -1,0 +1,318 @@
+---
+# Script automatizado para instalar servicios utilizando clave SSH
+- name: Identificar VM e instalar servicios
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - ../vars/db.yml
+    - ../vars/api.yml
+
+  tasks:
+    # Verificar conexión a base de datos
+    - name: Verificar conexión a la base de datos
+      shell: mysql -h {{ db_host }} -u {{ db_user }} -p{{ db_password }} {{ db_name }} -e "SELECT 1"
+      register: db_check
+      ignore_errors: yes
+      changed_when: false
+      no_log: true
+
+    # Obtener la primera VM en estado 'configurando'
+    - name: Obtener primera VM en estado 'configurando'
+      shell: >
+        mysql -h {{ db_host }} -u {{ db_user }} -p{{ db_password }} {{ db_name }}
+        -e "SELECT
+            id,
+            vmid,
+            hostname,
+            ip_publica
+        FROM vms
+        WHERE estado = 'configurando'
+        ORDER BY id ASC
+        LIMIT 1"
+        --skip-column-names
+      register: vm_info
+      changed_when: false
+      when: db_check.rc == 0
+
+    # Mostrar mensaje si no hay VMs para configurar
+    - name: Verificar si hay VMs para configurar
+      fail:
+        msg: "No se encontraron VMs en estado 'configurando'"
+      when: vm_info.stdout is defined and vm_info.stdout == ""
+
+    # Extraer información de la VM
+    - name: Extraer información de la VM
+      set_fact:
+        vm_id: "{{ vm_info.stdout.split('\t')[0] }}"
+        vm_vmid: "{{ vm_info.stdout.split('\t')[1] }}"
+        vm_hostname: "{{ vm_info.stdout.split('\t')[2] }}"
+        vm_ip: "{{ vm_info.stdout.split('\t')[3] }}"
+      when: vm_info.stdout is defined and vm_info.stdout != ""
+
+    - name: Mostrar información de la VM
+      debug:
+        msg:
+          - "ID: {{ vm_id }}"
+          - "VMID: {{ vm_vmid }}"
+          - "Hostname: {{ vm_hostname }}"
+          - "IP: {{ vm_ip }}"
+      when: vm_info.stdout is defined and vm_info.stdout != ""
+
+    # Verificar estado de la VM
+    - name: Verificar estado de la VM
+      uri:
+        url: "https://{{ api_host }}:8006/api2/json/nodes/{{ proxmox_node }}/qemu/{{ vm_vmid }}/status/current"
+        method: GET
+        headers:
+          Authorization: "PVEAPIToken={{ api_user }}!{{ api_token_id }}={{ api_token_secret }}"
+        validate_certs: false
+      register: vm_status
+      when: vm_vmid is defined
+
+    - name: Mostrar estado actual de la VM
+      debug:
+        msg: "Estado actual de la VM: {{ vm_status.json.data.status }}"
+      when: vm_vmid is defined and vm_status is defined
+
+    # Iniciar la VM si está apagada
+    - name: Iniciar la VM si está apagada
+      uri:
+        url: "https://{{ api_host }}:8006/api2/json/nodes/{{ proxmox_node }}/qemu/{{ vm_vmid }}/status/start"
+        method: POST
+        headers:
+          Authorization: "PVEAPIToken={{ api_user }}!{{ api_token_id }}={{ api_token_secret }}"
+        body_format: form-urlencoded
+        validate_certs: false
+      register: start_result
+      when:
+        - vm_vmid is defined
+        - vm_status.json.data.status == "stopped"
+
+    # Esperar entre 1 y 2 minutos para que la VM arranque completamente
+    - name: Esperar a que la VM arranque completamente (90 segundos)
+      pause:
+        seconds: 90
+      when:
+        - vm_vmid is defined
+        - vm_status.json.data.status == "stopped"
+        - start_result is defined
+        - start_result is success
+
+    # Esperar a que el SSH esté disponible
+    - name: Esperar a que SSH esté disponible
+      wait_for:
+        host: "{{ vm_ip }}"
+        port: 22
+        delay: 5
+        timeout: 300
+      when: vm_info.stdout is defined and vm_info.stdout != ""
+
+    # Añadir VM al inventario para instalación
+    - name: Añadir VM al inventario
+      add_host:
+        name: "{{ vm_ip }}"
+        groups: target_vm
+        ansible_user: base
+        ansible_ssh_private_key_file: ~/.ssh/id_rsa
+        ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+        vm_hostname: "{{ vm_hostname }}"
+      when: vm_info.stdout is defined and vm_info.stdout != ""
+
+# Segundo play para instalar servicios en la VM
+- name: Instalar servicios en la VM
+  hosts: target_vm
+  gather_facts: yes
+  become: yes
+  become_method: sudo
+
+  tasks:
+    # Asegurarse de que no haya bloqueos apt activos
+    - name: Esperar a que se liberen los bloqueos apt
+      shell: |
+        while lsof /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || lsof /var/lib/apt/lists/lock >/dev/null 2>&1 || lsof /var/lib/dpkg/lock >/dev/null 2>&1; do
+          echo "Esperando a que se libere el bloqueo apt..."
+          sleep 5
+        done
+      changed_when: false
+
+    - name: Verificar procesos apt en ejecución
+      shell: ps aux | grep -i apt
+      register: apt_processes
+      changed_when: false
+
+    - name: Mostrar procesos apt en ejecución
+      debug:
+        var: apt_processes.stdout_lines
+
+    - name: Actualizar repositorios
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Instalar Apache2
+      apt:
+        name: apache2
+        state: present
+
+    - name: Instalar MariaDB
+      apt:
+        name: mariadb-server
+        state: present
+
+    - name: Instalar PHP y módulos
+      apt:
+        name:
+          - php
+          - php-mysql
+          - php-gd
+          - php-cli
+          - php-curl
+          - php-json
+          - php-mbstring
+          - php-xml
+          - php-zip
+          - libapache2-mod-php
+        state: present
+
+    - name: Instalar ProFTP
+      apt:
+        name: proftpd
+        state: present
+
+    - name: Configurar directorio raíz por defecto en ProFTPd
+      lineinfile:
+        path: /etc/proftpd/proftpd.conf
+        line: "DefaultRoot /var/www/html"
+        state: present
+      notify: Reiniciar ProFTPd
+
+    - name: Forzar reinicio de ProFTPd
+      systemd:
+        name: proftpd
+        state: restarted
+      ignore_errors: true
+
+    - name: Añadir clave Zabbix
+      apt_key:
+        url: https://repo.zabbix.com/zabbix-official-repo.key
+        state: present
+
+    - name: Añadir repositorio Zabbix
+      apt_repository:
+        repo: "deb https://repo.zabbix.com/zabbix/6.0/ubuntu {{ ansible_distribution_release }} main"
+        state: present
+        filename: zabbix
+
+    - name: Actualizar caché APT después de añadir repositorio
+      apt:
+        update_cache: yes
+
+    - name: Instalar Zabbix Agent 2
+      apt:
+        name: zabbix-agent2
+        state: present
+
+    - name: Configurar Zabbix Agent 2
+      template:
+        src: ../templates/zabbix_agent2.conf.j2
+        dest: /etc/zabbix/zabbix_agent2.conf
+        owner: root
+        group: root
+        mode: 0644
+
+    - name: Crear directorio para logs de Zabbix si no existe
+      file:
+        path: /var/log/zabbix
+        state: directory
+        owner: zabbix
+        group: zabbix
+        mode: '0755'
+
+    - name: Verificar permisos de archivos de Zabbix
+      shell: chown -R zabbix:zabbix /etc/zabbix
+
+    - name: Verificar configuración de Zabbix Agent 2
+      command: zabbix_agent2 -t /etc/zabbix/zabbix_agent2.conf -v
+      register: zabbix_config_check
+      changed_when: false
+      ignore_errors: true
+
+    - name: Mostrar resultado de verificación de configuración
+      debug:
+        var: zabbix_config_check.stdout_lines
+      when: zabbix_config_check is defined
+
+    - name: Ver logs de Zabbix Agent 2
+      shell: cat /var/log/zabbix/zabbix_agent2.log || echo "No logs found"
+      register: zabbix_logs
+      ignore_errors: true
+      changed_when: false
+
+    - name: Mostrar logs de Zabbix
+      debug:
+        var: zabbix_logs.stdout_lines
+      when: zabbix_logs is defined
+
+    - name: Forzar reinicio de Zabbix Agent 2
+      systemd:
+        name: zabbix-agent2
+        state: restarted
+        daemon_reload: yes
+      ignore_errors: true
+
+    - name: Instalar WP-CLI
+      get_url:
+        url: https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
+        dest: /usr/local/bin/wp
+        mode: 0755
+
+    - name: Iniciar y habilitar Apache
+      systemd:
+        name: apache2
+        state: started
+        enabled: yes
+
+    - name: Iniciar y habilitar MariaDB
+      systemd:
+        name: mysql
+        state: started
+        enabled: yes
+
+    - name: Iniciar y habilitar ProFTP
+      systemd:
+        name: proftpd
+        state: started
+        enabled: yes
+
+    - name: Iniciar y habilitar Zabbix Agent 2
+      systemd:
+        name: zabbix-agent2
+        state: started
+        enabled: yes
+
+  handlers:
+    - name: Reiniciar Zabbix Agent 2
+      systemd:
+        name: zabbix-agent2
+        state: restarted
+
+    - name: Reiniciar ProFTPd
+      systemd:
+        name: proftpd
+        state: restarted
+
+# Tercer play para actualizar el estado en la base de datos
+- name: Actualizar estado en la base de datos
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - ../vars/db.yml
+
+  tasks:
+    - name: Actualizar estado en la base de datos
+      shell: >
+        mysql -h {{ db_host }} -u {{ db_user }} -p{{ db_password }} {{ db_name }}
+        -e "UPDATE vms
+            SET estado = 'completado'
+            WHERE id = {{ hostvars['localhost']['vm_id'] }}"
+      when: hostvars['localhost']['vm_id'] is defined
